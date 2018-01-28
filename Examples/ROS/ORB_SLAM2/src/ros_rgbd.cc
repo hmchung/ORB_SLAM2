@@ -43,6 +43,8 @@
 
 using namespace std;
 
+tf::Quaternion hamiltonProduct(tf::Quaternion a, tf::Quaternion b);
+
 class ImageGrabber
 {
 public:
@@ -66,23 +68,35 @@ int main(int argc, char **argv)
 {
     ros::init(argc, argv, "RGBD");
     ros::start();
-    ros::NodeHandle nh;
+    ros::NodeHandle nh("~");
     tf::TransformBroadcaster br;
 
-    if(argc != 3)
-    {
-        cerr << endl << "Usage: rosrun ORB_SLAM2 RGBD path_to_vocabulary path_to_settings" << endl;        
-        ros::shutdown();
-        return 1;
-    }    
+    // if(argc != 3)
+    // {
+    //     cerr << endl << "Usage: rosrun ORB_SLAM2 RGBD path_to_vocabulary path_to_settings" << endl;        
+    //     ros::shutdown();
+    //     return 1;
+    // }    
+    
+    string strSettingsFile = "/home/chung/ws/orb_slam2_ws/ORB_SLAM2/Examples/ROS/ORB_SLAM2/Asus.yaml";
+    string strVocFile = "/home/chung/ws/orb_slam2_ws/ORB_SLAM2/Vocabulary/ORBvoc.txt";
+
+    string topic_rgb = "/camera/rgb/image_raw";
+    string topic_depth = "/camera/depth/image";
+
+    nh.param<std::string>("strSettingsFile", strSettingsFile, strSettingsFile);
+    nh.param<std::string>("strVocFile", strVocFile, strVocFile);
+    nh.param<std::string>("topic_rgb", topic_rgb, topic_rgb);
+    nh.param<std::string>("topic_depth", topic_depth, topic_depth);
 
     // Create SLAM system. It initializes all system threads and gets ready to process frames.
-    ORB_SLAM2::System SLAM(argv[1],argv[2],ORB_SLAM2::System::RGBD,true);
+    // ORB_SLAM2::System SLAM(argv[1],argv[2],ORB_SLAM2::System::RGBD,true);
+    ORB_SLAM2::System SLAM(strVocFile, strSettingsFile, ORB_SLAM2::System::RGBD, false);
 
     ImageGrabber igb(&SLAM, nh, &br);
 
-    message_filters::Subscriber<sensor_msgs::Image> rgb_sub(nh, "/camera/rgb/image_color", 1);
-    message_filters::Subscriber<sensor_msgs::Image> depth_sub(nh, "/camera/depth/image", 1);
+    message_filters::Subscriber<sensor_msgs::Image> rgb_sub(nh, topic_rgb, 1);
+    message_filters::Subscriber<sensor_msgs::Image> depth_sub(nh, topic_depth, 1);
     typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::Image, sensor_msgs::Image> sync_pol;
     message_filters::Synchronizer<sync_pol> sync(sync_pol(10), rgb_sub,depth_sub);
     sync.registerCallback(boost::bind(&ImageGrabber::GrabRGBD,&igb,_1,_2));
@@ -98,6 +112,18 @@ int main(int argc, char **argv)
     ros::shutdown();
 
     return 0;
+}
+
+tf::Quaternion hamiltonProduct(tf::Quaternion a, tf::Quaternion b) 
+{    
+    tf::Quaternion c;
+
+        c[0] = (a[0]*b[0]) - (a[1]*b[1]) - (a[2]*b[2]) - (a[3]*b[3]);
+        c[1] = (a[0]*b[1]) + (a[1]*b[0]) + (a[2]*b[3]) - (a[3]*b[2]);
+        c[2] = (a[0]*b[2]) - (a[1]*b[3]) + (a[2]*b[0]) + (a[3]*b[1]);
+        c[3] = (a[0]*b[3]) + (a[1]*b[2]) - (a[2]*b[1]) + (a[3]*b[0]);
+
+    return c;
 }
 
 void ImageGrabber::GrabRGBD(const sensor_msgs::ImageConstPtr& msgRGB,const sensor_msgs::ImageConstPtr& msgD)
@@ -125,43 +151,64 @@ void ImageGrabber::GrabRGBD(const sensor_msgs::ImageConstPtr& msgRGB,const senso
         return;
     }
 
-    mpSLAM->TrackRGBD(cv_ptrRGB->image,cv_ptrD->image,cv_ptrRGB->header.stamp.toSec());
+    cv::Mat pose = mpSLAM->TrackRGBD(cv_ptrRGB->image,cv_ptrD->image,cv_ptrRGB->header.stamp.toSec());
 
-    vector<ORB_SLAM2::KeyFrame*> key_frames = mpSLAM->getMap()->GetAllKeyFrames();
+    if (pose.empty())    return;
 
-    sort(key_frames.begin(), key_frames.end(), ORB_SLAM2::KeyFrame::lId);
-    
-    cv::Mat Two = key_frames[0]->GetPoseInverse();
+    //Quaternion
+    tf::Matrix3x3 tf3d;
+    tf3d.setValue(pose.at<float>(0,0), pose.at<float>(0,1), pose.at<float>(0,2),
+            pose.at<float>(1,0), pose.at<float>(1,1), pose.at<float>(1,2),
+            pose.at<float>(2,0), pose.at<float>(2,1), pose.at<float>(2,2));
 
-    ORB_SLAM2::KeyFrame* pKF = mpSLAM->getTracker()->mCurrentFrame.mpReferenceKF;
-    cv::Mat Trw = cv::Mat::eye(4, 4, CV_32F);
+    tf::Quaternion tfqt;
+    tf3d.getRotation(tfqt);
+    double aux = tfqt[0];
+        tfqt[0]=-tfqt[2];
+        tfqt[2]=tfqt[1];
+        tfqt[1]=aux;
 
-    Trw = Trw*pKF->GetPose()*Two;
-    cv::Mat lit = mpSLAM->getTracker()->mlRelativeFramePoses.back();
-    cv::Mat Tcw = lit*Trw;
-    cv::Mat Rwc = Tcw.rowRange(0, 3).colRange(0, 3).t();
-    cv::Mat twc = -Rwc*Tcw.rowRange(0, 3).col(3);
-    vector<float> q = ORB_SLAM2::Converter::toQuaternion(Rwc);
 
-    ORB_SLAM2::KeyFrame *key_frame = key_frames.back();
 
-    if (key_frame->isBad())
-        return;
+    //Translation for camera
+    tf::Vector3 origin;
+    origin.setValue(pose.at<float>(0,3),pose.at<float>(1,3),pose.at<float>(2,3));
+    //rotate 270deg about x and 270deg about x to get ENU: x forward, y left, z up
+    const tf::Matrix3x3 rotation270degXZ(   0, 1, 0,
+                                            0, 0, 1,
+                                            -1, 0, 0);
 
-    // cv::Mat R = key_frame->GetRotation().t();
-    // vector<float> q = ORB_SLAM2::Converter::toQuaternion(R);
-    // cv::Mat twc = key_frame->GetCameraCenter();
+    tf::Vector3 translationForCamera = origin * rotation270degXZ;
+
+    //Hamilton (Translation for world)
+    tf::Quaternion quaternionForHamilton(tfqt[3], tfqt[0], tfqt[1], tfqt[2]);
+    tf::Quaternion secondQuaternionForHamilton(tfqt[3], -tfqt[0], -tfqt[1], -tfqt[2]);
+    tf::Quaternion translationHamilton(0, translationForCamera[0], translationForCamera[1], translationForCamera[2]);
+
+    tf::Quaternion translationStepQuat;
+    translationStepQuat = hamiltonProduct(hamiltonProduct(quaternionForHamilton, translationHamilton), secondQuaternionForHamilton);
+
+    tf::Vector3 translation(translationStepQuat[1], translationStepQuat[2], translationStepQuat[3]);
+
+    // //Scaling
+    // if(m_numScales > 0) {
+    //     translation = m_scale * translation;
+    // }
+    // //Set world
+    // m_currentQ = tfqt;
+    // m_currentT = translation;
+    // translation = translation - m_worldT;
+    // tfqt = tfqt * m_worldQ.inverse();
+
+    //Creates transform and populates it with translation and quaternion
+    tf::Transform transformCurrent;
+    transformCurrent.setOrigin(translation);
+    transformCurrent.setRotation(tfqt);
+
+    br->sendTransform(tf::StampedTransform(transformCurrent, ros::Time::now(), "world", "orb_slam"));
 
     geometry_msgs::Pose kf_pose;
-
-    kf_pose.position.x = twc.at<float>(0);
-    kf_pose.position.y = twc.at<float>(1);
-    kf_pose.position.z = twc.at<float>(2);
-    kf_pose.orientation.x = q[0];
-    kf_pose.orientation.y = q[1];
-    kf_pose.orientation.z = q[2];
-    kf_pose.orientation.w = q[3];
-
+    tf::poseTFToMsg(transformCurrent, kf_pose);
     kf_publisher.publish(kf_pose);
 
     geometry_msgs::PoseStamped kf_pose_stamped;
@@ -169,8 +216,4 @@ void ImageGrabber::GrabRGBD(const sensor_msgs::ImageConstPtr& msgRGB,const senso
     kf_pose_stamped.header.frame_id = "world";
     kf_pose_stamped.pose = kf_pose;
     kf_stamped_publisher.publish(kf_pose_stamped);
-
-    tf::StampedTransform transform;
-    tf::poseMsgToTF(kf_pose, transform);
-    br->sendTransform(tf::StampedTransform(transform, ros::Time::now(), "world", "orb_slam"));
 }
